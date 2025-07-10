@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>학교 실험실 가이드 챗봇</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel CDN for JSX transformation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        /* Inter font for better readability */
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Main App component
+        function App() {
+            const [labData, setLabData] = React.useState([]); // Stores parsed CSV data
+            const [messages, setMessages] = React.useState([]); // Stores chat messages
+            const [userInput, setUserInput] = React.useState(''); // Current user input
+            const [isLoading, setIsLoading] = React.useState(false); // Loading state for AI response
+            const fileInputRef = React.useRef(null); // Ref for file input element
+            const messagesEndRef = React.useRef(null); // Ref for scrolling to the latest message
+
+            // Scroll to the bottom of the chat messages whenever messages change
+            React.useEffect(() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+            }, [messages]);
+
+            /**
+             * Handles CSV file upload and parsing.
+             * @param {Event} event - The file input change event.
+             */
+            const handleFileUpload = (event) => {
+                const file = event.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        const text = e.target.result;
+                        parseCSV(text);
+                    };
+                    reader.readAsText(file, 'UTF-8'); // Read as UTF-8 to handle Korean characters
+                }
+            };
+
+            /**
+             * Parses the CSV text content into an array of objects.
+             * Assumes format: Lab Type, Tool Name, Specific Location
+             * @param {string} csvText - The raw CSV content as a string.
+             */
+            const parseCSV = (csvText) => {
+                const lines = csvText.split('\n').filter(line => line.trim() !== ''); // Split by line and remove empty lines
+                const parsedData = lines.map(line => {
+                    const parts = line.split(','); // Simple split by comma
+                    if (parts.length >= 3) {
+                        return {
+                            labType: parts[0].trim(),
+                            toolName: parts[1].trim(),
+                            location: parts[2].trim()
+                        };
+                    }
+                    return null;
+                }).filter(item => item !== null); // Filter out any malformed lines
+                setLabData(parsedData);
+                setMessages(prev => [...prev, { sender: 'bot', text: `CSV 파일이 성공적으로 업로드되었습니다. ${parsedData.length}개의 도구 데이터를 불러왔습니다.` }]);
+            };
+
+            /**
+             * Sends user input to the AI chatbot for processing.
+             */
+            const sendMessage = async () => {
+                if (!userInput.trim()) return;
+
+                const newUserMessage = { sender: 'user', text: userInput };
+                setMessages(prev => [...prev, newUserMessage]);
+                setUserInput(''); // Clear input field
+
+                setIsLoading(true);
+
+                try {
+                    // IMPORTANT: If running this HTML file directly (outside of Canvas environment),
+                    // you MUST replace "" with your actual Gemini API Key.
+                    // Get your API key from Google AI Studio: https://aistudio.google.com/app/apikey
+                    const apiKey = "AIzaSyByqU6mQic8zo1pdTZRsbJqh7G4FCwwAOc"; 
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+                    // Check if API key is provided
+                    if (!apiKey) {
+                        setMessages(prev => [...prev, { sender: 'bot', text: "죄송합니다. Gemini API 키가 설정되지 않았습니다. 코드 내의 'apiKey' 변수에 유효한 API 키를 입력해주세요." }]);
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    // Step 0: Check if the user's query is relevant to laboratory tools or locations
+                    const relevanceCheckPrompt = `다음 사용자 질문이 실험실 도구 또는 위치와 관련된 질문인지 JSON 형식으로 응답해주세요. 관련이 있다면 {"isRelevant": true}로, 관련이 없다면 {"isRelevant": false}로 응답해주세요.
+                    예시:
+                    사용자: 비커는 어디에 있나요?
+                    응답: {"isRelevant": true}
+
+                    사용자: 오늘 날씨는 어떤가요?
+                    응답: {"isRelevant": false}
+
+                    사용자 질문: ${newUserMessage.text}`;
+
+                    const relevancePayload = {
+                        contents: [{ role: "user", parts: [{ text: relevanceCheckPrompt }] }],
+                        generationConfig: {
+                            responseMimeType: "application/json",
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    "isRelevant": { "type": "BOOLEAN" }
+                                }
+                            }
+                        }
+                    };
+
+                    console.log("Sending relevance check request to Gemini API...");
+                    const relevanceResponse = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(relevancePayload)
+                    });
+
+                    if (!relevanceResponse.ok) {
+                        const errorBody = await relevanceResponse.text();
+                        console.error(`Relevance check API request failed with status ${relevanceResponse.status}:`, errorBody);
+                        setMessages(prev => [...prev, { sender: 'bot', text: `죄송합니다. 질문 관련성 확인 중 오류가 발생했습니다. (상태 코드: ${relevanceResponse.status})` }]);
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    const relevanceResult = await relevanceResponse.json();
+                    console.log("Relevance check API response:", relevanceResult);
+
+                    let isRelevant = false;
+                    if (relevanceResult.candidates && relevanceResult.candidates.length > 0 &&
+                        relevanceResult.candidates[0].content && relevanceResult.candidates[0].content.parts &&
+                        relevanceResult.candidates[0].content.parts.length > 0) {
+                        try {
+                            const jsonResponse = JSON.parse(relevanceResult.candidates[0].content.parts[0].text);
+                            isRelevant = jsonResponse.isRelevant;
+                        } catch (parseError) {
+                            console.error("Failed to parse relevance JSON:", parseError);
+                            setMessages(prev => [...prev, { sender: 'bot', text: "죄송합니다. 질문 관련성을 해석하는 데 문제가 발생했습니다." }]);
+                            setIsLoading(false);
+                            return;
+                        }
+                    } else {
+                        console.warn("Relevance check API response did not contain expected content structure.");
+                        setMessages(prev => [...prev, { sender: 'bot', text: "죄송합니다. 질문 관련성을 확인할 수 없습니다. 다시 시도해 주세요." }]);
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    if (!isRelevant) {
+                        setMessages(prev => [...prev, { sender: 'bot', text: "죄송합니다. 저는 학교 실험실 도구 및 위치에 대한 질문에만 답변할 수 있습니다. 다른 질문이 있으시면 실험실 관련 내용을 말씀해주세요." }]);
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    // Step 1: Ask Gemini to identify the tool name from the user's query
+                    const toolIdentificationPrompt = `다음 사용자 질문에서 찾고 있는 '도구 이름'을 식별하여 JSON 형식으로 응답해주세요. 도구 이름을 찾을 수 없다면 "unknown"으로 응답해주세요.
+                    예시:
+                    사용자: 비커는 어디에 있나요?
+                    응답: {"toolName": "비커"}
+
+                    사용자: 시험관의 위치를 알려주세요.
+                    응답: {"toolName": "시험관"}
+
+                    사용자: 안녕하세요
+                    응답: {"toolName": "unknown"}
+
+                    사용자 질문: ${newUserMessage.text}`;
+
+                    const toolIdentificationPayload = {
+                        contents: [{ role: "user", parts: [{ text: toolIdentificationPrompt }] }],
+                        generationConfig: {
+                            responseMimeType: "application/json",
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    "toolName": { "type": "STRING" }
+                                }
+                            }
+                        }
+                    };
+
+                    console.log("Sending tool identification request to Gemini API...");
+                    const toolIdentificationResponse = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(toolIdentificationPayload)
+                    });
+
+                    // Check if the HTTP response was successful
+                    if (!toolIdentificationResponse.ok) {
+                        const errorBody = await toolIdentificationResponse.text();
+                        console.error(`Tool identification API request failed with status ${toolIdentificationResponse.status}:`, errorBody);
+                        setMessages(prev => [...prev, { sender: 'bot', text: `죄송합니다. 도구 식별 중 오류가 발생했습니다. (상태 코드: ${toolIdentificationResponse.status})` }]);
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    const toolIdentificationResult = await toolIdentificationResponse.json();
+                    console.log("Tool identification API response:", toolIdentificationResult);
+
+                    let identifiedToolName = "unknown";
+
+                    if (toolIdentificationResult.candidates && toolIdentificationResult.candidates.length > 0 &&
+                        toolIdentificationResult.candidates[0].content && toolIdentificationResult.candidates[0].content.parts &&
+                        toolIdentificationResult.candidates[0].content.parts.length > 0) {
+                        try {
+                            const jsonResponse = JSON.parse(toolIdentificationResult.candidates[0].content.parts[0].text);
+                            identifiedToolName = jsonResponse.toolName || "unknown";
+                        } catch (parseError) {
+                            console.error("Failed to parse tool identification JSON:", parseError);
+                            setMessages(prev => [...prev, { sender: 'bot', text: "죄송합니다. 도구 이름을 해석하는 데 문제가 발생했습니다." }]);
+                            setIsLoading(false);
+                            return;
+                        }
+                    } else {
+                        console.warn("Tool identification API response did not contain expected content structure.");
+                        setMessages(prev => [...prev, { sender: 'bot', text: "죄송합니다. 도구 이름을 식별할 수 없습니다. 다시 시도해 주세요." }]);
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    let botResponseText = '';
+                    let foundTool = null;
+
+                    if (identifiedToolName !== "unknown" && labData.length > 0) {
+                        // Search for the tool in the loaded lab data (case-insensitive)
+                        foundTool = labData.find(item =>
+                            item.toolName.toLowerCase().includes(identifiedToolName.toLowerCase())
+                        );
+                    }
+
+                    // Step 2: Generate a natural language response based on the search result
+                    let finalPrompt = '';
+                    if (foundTool) {
+                        finalPrompt = `사용자가 "${newUserMessage.text}"라고 질문했습니다. 사용자가 찾고 있는 도구는 "${identifiedToolName}"입니다. 이 도구는 "${foundTool.labType}"에 "${foundTool.location}"에 있습니다. 이 정보를 바탕으로 사용자에게 친절하고 자연스러운 답변을 제공해주세요.`;
+                    } else if (identifiedToolName !== "unknown") {
+                        finalPrompt = `사용자가 "${newUserMessage.text}"라고 질문했습니다. 사용자가 찾고 있는 도구는 "${identifiedToolName}"이지만, 이 도구는 현재 데이터베이스에서 찾을 수 없습니다. 도구를 찾을 수 없다는 내용을 친절하고 자연스러운 답변으로 제공해주세요.`;
+                    } else {
+                        finalPrompt = `사용자가 "${newUserMessage.text}"라고 질문했습니다. 이 질문에서 특정 도구를 식별할 수 없습니다. 사용자에게 어떤 도구를 찾고 있는지 명확히 알려달라는 친절하고 자연스러운 답변을 제공해주세요.`;
+                    }
+
+                    const finalPayload = {
+                        contents: [{ role: "user", parts: [{ text: finalPrompt }] }]
+                    };
+
+                    console.log("Sending final response generation request to Gemini API...");
+                    const finalResponse = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(finalPayload)
+                    });
+
+                    // Check if the HTTP response was successful
+                    if (!finalResponse.ok) {
+                        const errorBody = await finalResponse.text();
+                        console.error(`Final response API request failed with status ${finalResponse.status}:`, errorBody);
+                        setMessages(prev => [...prev, { sender: 'bot', text: `죄송합니다. 답변 생성 중 오류가 발생했습니다. (상태 코드: ${finalResponse.status})` }]);
+                        setIsLoading(false);
+                        return;
+                    }
+
+                    const finalResult = await finalResponse.json();
+                    console.log("Final response API response:", finalResult);
+
+                    if (finalResult.candidates && finalResult.candidates.length > 0 &&
+                        finalResult.candidates[0].content && finalResult.candidates[0].content.parts &&
+                        finalResult.candidates[0].content.parts.length > 0) {
+                        botResponseText = finalResult.candidates[0].content.parts[0].text;
+                    } else {
+                        console.warn("Final response API response did not contain expected content structure.");
+                        botResponseText = "죄송합니다. 답변을 생성하는 데 문제가 발생했습니다. (응답 내용 없음)";
+                    }
+
+                    setMessages(prev => [...prev, { sender: 'bot', text: botResponseText }]);
+
+                } catch (error) {
+                    console.error("Error communicating with Gemini API:", error);
+                    setMessages(prev => [...prev, { sender: 'bot', text: "죄송합니다. AI 응답을 가져오는 데 네트워크 오류 또는 예기치 않은 오류가 발생했습니다." }]);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            return (
+                <div className="min-h-screen bg-gray-100 flex flex-col items-center justify-center p-4 font-inter">
+                    <div className="bg-white shadow-lg rounded-lg w-full max-w-2xl flex flex-col h-[80vh]">
+                        {/* Header */}
+                        <div className="p-4 bg-blue-600 text-white rounded-t-lg text-center">
+                            <h1 className="text-2xl font-bold">학교 실험실 가이드 챗봇</h1>
+                        </div>
+
+                        {/* File Upload Section */}
+                        <div className="p-4 border-b border-gray-200">
+                            <label htmlFor="csv-upload" className="block text-gray-700 text-sm font-bold mb-2">
+                                CSV 파일 업로드:
+                            </label>
+                            <input
+                                type="file"
+                                id="csv-upload"
+                                ref={fileInputRef}
+                                accept=".csv"
+                                onChange={handleFileUpload}
+                                className="block w-full text-sm text-gray-500
+                                           file:mr-4 file:py-2 file:px-4
+                                           file:rounded-full file:border-0
+                                           file:text-sm file:font-semibold
+                                           file:bg-blue-50 file:text-blue-700
+                                           hover:file:bg-blue-100"
+                            />
+                            {labData.length > 0 && (
+                                <p className="text-sm text-gray-600 mt-2">
+                                    현재 {labData.length}개의 도구 데이터가 로드되었습니다.
+                                </p>
+                            )}
+                        </div>
+
+                        {/* Chat Messages Display */}
+                        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                            {messages.map((msg, index) => (
+                                <div key={index} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                    <div className={`max-w-[70%] p-3 rounded-lg shadow-md ${
+                                        msg.sender === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'
+                                    }`}>
+                                        {msg.text}
+                                    </div>
+                                </div>
+                            ))}
+                            {isLoading && (
+                                <div className="flex justify-start">
+                                    <div className="max-w-[70%] p-3 rounded-lg shadow-md bg-gray-200 text-gray-800">
+                                        <div className="animate-pulse flex space-x-2">
+                                            <div className="rounded-full bg-gray-400 h-2 w-2"></div>
+                                            <div className="rounded-full bg-gray-400 h-2 w-2"></div>
+                                            <div className="rounded-full bg-gray-400 h-2 w-2"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                            <div ref={messagesEndRef} /> {/* For auto-scrolling */}
+                        </div>
+
+                        {/* User Input Area */}
+                        <div className="p-4 border-t border-gray-200 flex items-center">
+                            <input
+                                type="text"
+                                value={userInput}
+                                onChange={(e) => setUserInput(e.target.value)}
+                                onKeyPress={(e) => {
+                                    if (e.key === 'Enter' && !isLoading) {
+                                        sendMessage();
+                                    }
+                                }}
+                                placeholder="도구 이름을 입력하세요 (예: 비커는 어디에 있나요?)"
+                                className="flex-1 p-3 border border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                disabled={isLoading}
+                            />
+                            <button
+                                onClick={sendMessage}
+                                className="px-6 py-3 bg-blue-600 text-white rounded-r-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                                disabled={isLoading}
+                            >
+                                전송
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Render the App component into the 'root' div
+        // ReactDOM.render is deprecated in React 18. Use createRoot instead.
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
